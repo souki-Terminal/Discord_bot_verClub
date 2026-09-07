@@ -1,0 +1,24 @@
+# Environments
+.env
+
+# Tokens and Secrets
+トークン置き場.txt
+
+# Database
+bot_database.db
+bot_database.db-journal
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# OS / IDE / Others
+.DS_Store
+.vscode/
+.gemini/
