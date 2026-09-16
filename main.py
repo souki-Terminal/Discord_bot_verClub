@@ -12,6 +12,8 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 ADMIN_CHANNEL_ID = int(os.getenv('ADMIN_CHANNEL_ID', 0))
 ATTENDANCE_CHANNEL_ID = int(os.getenv('ATTENDANCE_CHANNEL_ID', 0))
 ROOM_STATUS_CHANNEL_ID = int(os.getenv('ROOM_STATUS_CHANNEL_ID', 0))
+ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', 0)) # 任意: 管理操作を許可する役職ID
+
 
 DB_FILE = 'bot_database.db'
 
@@ -302,6 +304,35 @@ class DeleteRoomModal(discord.ui.Modal, title='部屋の削除'):
 class AdminPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    # 権限の二重チェック：管理者、管理権限、または指定役職を持つユーザーのみ操作を許可
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # DMでの操作はブロック
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("サーバー内でのみ実行可能です。", ephemeral=True)
+            return False
+
+        # 1. 管理者権限、サーバー管理権限、チャンネル管理権限のいずれかを持っているか
+        perms = interaction.user.guild_permissions
+        has_permission = perms.administrator or perms.manage_guild or perms.manage_channels
+
+        # 2. 指定された管理役職（ADMIN_ROLE_ID）を持っているか
+        if not has_permission and ADMIN_ROLE_ID > 0:
+            has_permission = any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
+
+        if has_permission:
+            return True
+
+        # 権限がない場合は親切な案内メッセージを返して処理をブロック
+        await interaction.response.send_message(
+            "⚠️ **操作権限がありません**\n"
+            "この操作を実行するには「管理者」または「サーバー/チャンネルの管理」権限（または指定の管理役職）が必要です。\n"
+            "※操作が必要な場合は、部長やサーバー管理者にお問い合わせください。",
+            ephemeral=True
+        )
+        return False
+
+
 
     @discord.ui.button(label="本日のイベントから出欠", style=discord.ButtonStyle.primary, emoji="📅", custom_id="admin_create_event_discord")
     async def btn_create_event_discord(self, interaction: discord.Interaction, button: discord.ui.Button):
