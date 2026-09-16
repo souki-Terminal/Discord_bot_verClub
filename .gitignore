@@ -22,3 +22,5 @@ env/
 .DS_Store
 .vscode/
 .gemini/
+*.zip
+
