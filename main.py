@@ -2,9 +2,19 @@ import discord
 from discord.ext import commands, tasks
 import aiosqlite
 import os
+import sys
+import logging
 from dotenv import load_dotenv
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# Windowsコンソールでの文字化け・UnicodeEncodeError対策
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # .envファイルから環境変数を読み込む
 load_dotenv()
@@ -423,17 +433,32 @@ class CircleManagerBot(commands.Bot):
         self.update_room_panels.start()
 
     async def on_ready(self):
-        print(f'Logged in as {self.user} (ID: {self.user.id})')
-        print('------')
+        logger = logging.getLogger('discord')
+        logger.info('========================================')
+        logger.info(f'Botログイン成功: {self.user} (ID: {self.user.id})')
+        logger.info(f'参加中のサーバー数: {len(self.guilds)}')
+        for guild in self.guilds:
+            logger.info(f'   - サーバー名: {guild.name} (ID: {guild.id})')
+        logger.info('========================================')
         
         # パネルの自己修復機能：管理チャンネルにパネルがなければ送信する
-        admin_channel = self.get_channel(ADMIN_CHANNEL_ID)
+        try:
+            admin_channel = self.get_channel(ADMIN_CHANNEL_ID)
+            if not admin_channel:
+                admin_channel = await self.fetch_channel(ADMIN_CHANNEL_ID)
+        except Exception as e:
+            logger.error(f'管理チャンネル (ID: {ADMIN_CHANNEL_ID}) の取得に失敗: {e}')
+            logger.error('   -> .env の ADMIN_CHANNEL_ID が正しいか、Botにそのチャンネルを見る権限があるか確認してください。')
+            admin_channel = None
+
         if admin_channel:
+            logger.info(f'管理チャンネルを検出: #{admin_channel.name}')
             panel_found = False
             async for message in admin_channel.history(limit=50):
                 if message.author == self.user and message.embeds:
                     if message.embeds[0].title == "⚙️ Bot管理パネル":
                         panel_found = True
+                        logger.info("既にBot管理パネルが存在するため新規作成をスキップ")
                         break
             
             if not panel_found:
@@ -442,8 +467,12 @@ class CircleManagerBot(commands.Bot):
                     description="以下のボタンをクリックして操作してください。\n※このメッセージを削除してしまった場合は、Botを再起動すると再設置されます。",
                     color=discord.Color.dark_theme()
                 )
-                await admin_channel.send(embed=embed, view=AdminPanelView())
-                print("管理パネルを自己修復（再送信）しました。")
+                try:
+                    await admin_channel.send(embed=embed, view=AdminPanelView())
+                    logger.info("管理パネルを送信（自己修復）しました！")
+                except Exception as e:
+                    logger.error(f"管理パネル送信失敗: {e}")
+        logger.info('========================================')
 
     # 定期タスク：出欠パネルのバッチ更新 (5秒に1回)
     # リアルタイム更新によるDiscord APIのレートリミット（制限）を回避するための設計
