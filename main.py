@@ -589,8 +589,11 @@ class CircleManagerBot(commands.Bot):
 
 # エントリーポイント
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(name)s: %(message)s')
+    print("🚀 Botの起動処理を開始します...", flush=True)
     if not TOKEN:
-        print("エラー: .env ファイルに DISCORD_TOKEN が設定されていません。")
+        print("❌ エラー: .env ファイルに DISCORD_TOKEN が設定されていません。", flush=True)
     else:
+        print("🔑 トークンを読み込みました。Discordサーバーへ接続中...", flush=True)
         bot = CircleManagerBot()
         bot.run(TOKEN)
