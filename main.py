@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 import aiosqlite
 import os
 import sys
+import re
 import logging
 import asyncio
 from dotenv import load_dotenv
@@ -26,18 +27,31 @@ ATTENDANCE_CHANNEL_ID = int(os.getenv('ATTENDANCE_CHANNEL_ID', 0))
 ROOM_STATUS_CHANNEL_ID = int(os.getenv('ROOM_STATUS_CHANNEL_ID', 0))
 ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', 0)) # 任意: 管理操作を許可する役職ID
 
-# Turso (クラウドSQLite) 設定 (未設定の場合はローカルの bot_database.db を自動使用)
-TURSO_DATABASE_URL = os.getenv('TURSO_DATABASE_URL')
-TURSO_AUTH_TOKEN = os.getenv('TURSO_AUTH_TOKEN')
+# Turso (クラウドSQLite) 設定
+raw_turso_url = (os.getenv('TURSO_DATABASE_URL') or '').strip().strip('\'"')
+raw_turso_token = (os.getenv('TURSO_AUTH_TOKEN') or '').strip().strip('\'"')
+
+# URLのプロトコルを安全な https:// 形式に正規化 (WebSocket 400エラー防止)
+if raw_turso_url:
+    # libsql:// や wss:// や http:// を https:// に変換してHTTPパイプライン通信を行う
+    TURSO_DATABASE_URL = re.sub(r'^(libsql|wss|http)://', 'https://', raw_turso_url)
+    if not TURSO_DATABASE_URL.startswith('https://'):
+        TURSO_DATABASE_URL = 'https://' + TURSO_DATABASE_URL
+else:
+    TURSO_DATABASE_URL = None
+
+TURSO_AUTH_TOKEN = raw_turso_token if raw_turso_token else None
 DB_FILE = 'bot_database.db'
 
 # --- データベース抽象化ヘルパー (Turso & SQLite 両対応) ---
+
+_turso_shared_client = None
 
 class LibsqlCursorWrapper:
     """Turso (libsql_client) の結果を aiosqlite カーソル互換で扱うためのラッパー"""
     def __init__(self, result_set):
         self._rs = result_set
-        self.rowcount = result_set.rows_affected
+        self.rowcount = getattr(result_set, 'rows_affected', 0)
 
     async def __aenter__(self):
         return self
@@ -46,12 +60,12 @@ class LibsqlCursorWrapper:
         pass
 
     async def fetchone(self):
-        if not self._rs or not self._rs.rows:
+        if not self._rs or not getattr(self._rs, 'rows', None) or len(self._rs.rows) == 0:
             return None
         return tuple(self._rs.rows[0])
 
     async def fetchall(self):
-        if not self._rs or not self._rs.rows:
+        if not self._rs or not getattr(self._rs, 'rows', None):
             return []
         return [tuple(r) for r in self._rs.rows]
 
@@ -62,13 +76,16 @@ class Database:
         return cls()
 
     async def __aenter__(self):
+        global _turso_shared_client
         if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
             try:
                 import libsql_client
-                self._client = libsql_client.create_client(
-                    url=TURSO_DATABASE_URL,
-                    auth_token=TURSO_AUTH_TOKEN
-                )
+                if _turso_shared_client is None:
+                    _turso_shared_client = libsql_client.create_client(
+                        url=TURSO_DATABASE_URL,
+                        auth_token=TURSO_AUTH_TOKEN
+                    )
+                self._client = _turso_shared_client
                 self._is_turso = True
             except Exception as e:
                 print(f"⚠️ Turso接続初期化エラー ({e})。ローカルSQLiteにフォールバックします", flush=True)
@@ -80,20 +97,22 @@ class Database:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._is_turso:
-            await self._client.close()
-        else:
+        if not self._is_turso and hasattr(self, '_conn'):
             await self._conn.close()
 
     async def execute(self, sql, params=()):
         if self._is_turso:
-            rs = await self._client.execute(sql, list(params))
-            return LibsqlCursorWrapper(rs)
+            try:
+                rs = await self._client.execute(sql, list(params))
+                return LibsqlCursorWrapper(rs)
+            except Exception as e:
+                print(f"⚠️ Tursoクエリ実行エラー: {e} (SQL: {sql[:50]}...)", flush=True)
+                raise e
         else:
             return await self._conn.execute(sql, params)
 
     async def commit(self):
-        if not self._is_turso:
+        if not self._is_turso and hasattr(self, '_conn'):
             await self._conn.commit()
 
 # データベース初期化関数
@@ -159,44 +178,44 @@ async def start_web_server():
         await site.start()
         print(f"🌐 Keep-Alive Webサーバー起動完了 (ポート: {port})", flush=True)
     except Exception as e:
-        print(f"⚠️ Webサーバーの起動をスキップまたは失敗: {e}", flush=True)
+        print(f"⚠️ Webサーバーの起動スキップ: {e}", flush=True)
 
 # --- UI コンポーネント (Persistent Views & Modals) ---
 
 # 出欠入力ボタンのView
 class AttendanceView(discord.ui.View):
     def __init__(self):
-        # timeout=None にすることで、Bot再起動後もボタンが機能し続ける (Persistent View)
         super().__init__(timeout=None)
 
     async def update_attendance(self, interaction: discord.Interaction, status: str):
-        # ボタンを押した際の応答を素早く返す (API制限回避のため)
         await interaction.response.defer(ephemeral=True)
         
         today_str = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
         
-        async with Database.connect() as db:
-            # イベントの開催日をチェック
-            async with await db.execute('SELECT event_date FROM events WHERE message_id = ?', (interaction.message.id,)) as cursor:
-                row = await cursor.fetchone()
-                if row and row[0]:
-                    event_date = row[0]
-                    # 開催日前なら登録ブロックしてパネルを削除
-                    if today_str < event_date:
-                        await interaction.message.delete()
-                        await interaction.followup.send(f"このイベント（{event_date}）は本日ではないため、古いパネルを削除しました。", ephemeral=True)
-                        return
+        try:
+            async with Database.connect() as db:
+                # イベントの開催日をチェック
+                async with await db.execute('SELECT event_date FROM events WHERE message_id = ?', (interaction.message.id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row and row[0]:
+                        event_date = row[0]
+                        # 開催日前なら登録ブロックしてパネルを削除
+                        if today_str < event_date:
+                            await interaction.message.delete()
+                            await interaction.followup.send(f"このイベント（{event_date}）は本日ではないため、古いパネルを削除しました。", ephemeral=True)
+                            return
 
-            # データベースの出欠情報を更新 (なければ挿入)
-            await db.execute('''
-                INSERT INTO attendances (message_id, user_id, user_name, status)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(message_id, user_id) DO UPDATE SET status=excluded.status
-            ''', (interaction.message.id, interaction.user.id, interaction.user.display_name, status))
-            await db.commit()
-            
-        # ユーザーには一時的なメッセージで通知
-        await interaction.followup.send(f"あなたの出欠を「{status}」で登録しました！\n※一覧への反映には数秒かかる場合があります。", ephemeral=True)
+                # データベースの出欠情報を更新 (なければ挿入)
+                await db.execute('''
+                    INSERT INTO attendances (message_id, user_id, user_name, status)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(message_id, user_id) DO UPDATE SET status=excluded.status
+                ''', (interaction.message.id, interaction.user.id, interaction.user.display_name, status))
+                await db.commit()
+                
+            await interaction.followup.send(f"あなたの出欠を「{status}」で登録しました！\n※一覧への反映には数秒かかる場合があります。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"出欠の登録中にエラーが発生しました: {e}", ephemeral=True)
 
     @discord.ui.button(label="出席", style=discord.ButtonStyle.success, emoji="⭕", custom_id="attend_yes")
     async def btn_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -234,7 +253,7 @@ class RoomStatusSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            custom_id="room_status_select" # Persistent Viewのための固定ID
+            custom_id="room_status_select"
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -245,20 +264,22 @@ class RoomStatusSelect(discord.ui.Select):
         room_name = self.values[0]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        async with Database.connect() as db:
-            # 現在の状態を取得して反転させる
-            async with await db.execute('SELECT is_open FROM rooms WHERE name = ?', (room_name,)) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    new_status = 0 if row[0] == 1 else 1
-                    await db.execute('UPDATE rooms SET is_open = ?, last_updated = ? WHERE name = ?', 
-                                     (new_status, now, room_name))
-                    await db.commit()
-                    
-                    status_text = "開放" if new_status == 1 else "施錠"
-                    await interaction.response.send_message(f"「{room_name}」を【{status_text}】に変更しました！\n※一覧への反映には数秒かかる場合があります。", ephemeral=True)
-                else:
-                    await interaction.response.send_message("部屋が見つかりませんでした。", ephemeral=True)
+        try:
+            async with Database.connect() as db:
+                async with await db.execute('SELECT is_open FROM rooms WHERE name = ?', (room_name,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        new_status = 0 if row[0] == 1 else 1
+                        await db.execute('UPDATE rooms SET is_open = ?, last_updated = ? WHERE name = ?', 
+                                         (new_status, now, room_name))
+                        await db.commit()
+                        
+                        status_text = "開放" if new_status == 1 else "施錠"
+                        await interaction.response.send_message(f"「{room_name}」を【{status_text}】に変更しました！\n※一覧への反映には数秒かかる場合があります。", ephemeral=True)
+                    else:
+                        await interaction.response.send_message("部屋が見つかりませんでした。", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"状態の変更中にエラーが発生しました: {e}", ephemeral=True)
 
 class RoomStatusView(discord.ui.View):
     def __init__(self, rooms: list):
@@ -282,7 +303,6 @@ class EventSelect(discord.ui.Select):
         await interaction.response.defer(ephemeral=True)
         
         event_id = int(self.values[0])
-        # キャッシュからイベントを取得
         guild_event = interaction.guild.get_scheduled_event(event_id)
         if not guild_event:
             await interaction.followup.send("イベントが見つかりませんでした。", ephemeral=True)
@@ -295,7 +315,6 @@ class EventSelect(discord.ui.Select):
             await interaction.followup.send("出欠チャンネルが見つかりません。設定を確認してください。", ephemeral=True)
             return
 
-        # 日時の表示用フォーマット
         display_time = guild_event.start_time.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y年%m月%d日 %H:%M")
         
         embed = discord.Embed(
@@ -309,7 +328,6 @@ class EventSelect(discord.ui.Select):
         view = AttendanceView()
         msg = await channel.send(embed=embed, view=view)
         
-        # DBにイベント情報を保存
         async with Database.connect() as db:
             await db.execute('INSERT INTO events (message_id, name, date, event_date) VALUES (?, ?, ?, ?)',
                              (msg.id, guild_event.name, display_time, date_str))
@@ -319,7 +337,7 @@ class EventSelect(discord.ui.Select):
 
 class EventSelectView(discord.ui.View):
     def __init__(self, events):
-        super().__init__(timeout=60.0) # 一時的なメニューなのでタイムアウトあり
+        super().__init__(timeout=60.0)
         self.add_item(EventSelect(events))
 
 # 手動出欠イベント作成用のModal
@@ -352,7 +370,6 @@ class CreateEventModal(discord.ui.Modal, title='出欠イベントの作成 (手
         view = AttendanceView()
         msg = await channel.send(embed=embed, view=view)
         
-        # DBにイベント情報を保存 (手動作成の場合は日付チェックを無効にするためNoneを渡す)
         async with Database.connect() as db:
             await db.execute('INSERT INTO events (message_id, name, date, event_date) VALUES (?, ?, ?, ?)',
                              (msg.id, self.event_name.value, self.event_date.value, None))
@@ -369,7 +386,7 @@ class AddRoomModal(discord.ui.Modal, title='部屋の追加'):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        name = self.room_name.value
+        name = self.room_name.value.strip()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         async with Database.connect() as db:
@@ -389,7 +406,7 @@ class DeleteRoomModal(discord.ui.Modal, title='部屋の削除'):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        name = self.room_name.value
+        name = self.room_name.value.strip()
         
         async with Database.connect() as db:
             cursor = await db.execute('DELETE FROM rooms WHERE name = ?', (name,))
@@ -404,25 +421,20 @@ class AdminPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # 権限の二重チェック：管理者、管理権限、または指定役職を持つユーザーのみ操作を許可
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # DMでの操作はブロック
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("サーバー内でのみ実行可能です。", ephemeral=True)
             return False
 
-        # 1. 管理者権限、サーバー管理権限、チャンネル管理権限のいずれかを持っているか
         perms = interaction.user.guild_permissions
         has_permission = perms.administrator or perms.manage_guild or perms.manage_channels
 
-        # 2. 指定された管理役職（ADMIN_ROLE_ID）を持っているか
         if not has_permission and ADMIN_ROLE_ID > 0:
             has_permission = any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
 
         if has_permission:
             return True
 
-        # 権限がない場合は親切な案内メッセージを返して処理をブロック
         await interaction.response.send_message(
             "⚠️ **操作権限がありません**\n"
             "この操作を実行するには「管理者」または「サーバー/チャンネルの管理」権限（または指定の管理役職）が必要です。\n"
@@ -468,7 +480,6 @@ class AdminPanelView(discord.ui.View):
             await interaction.followup.send("部室状況チャンネルが見つかりません。", ephemeral=True)
             return
             
-        # 過去のBotのメッセージ（パネル）を削除して重複を防ぐ
         try:
             await channel.purge(check=lambda m: m.author == interaction.client.user, limit=50)
         except Exception:
@@ -496,7 +507,6 @@ class CircleManagerBot(commands.Bot):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
 
-    # 起動時の初期化処理
     async def setup_hook(self):
         # データベースの初期化
         await init_db()
@@ -504,12 +514,10 @@ class CircleManagerBot(commands.Bot):
         # Keep-Alive Webサーバーの起動 (Render用)
         asyncio.create_task(start_web_server())
         
-        # 永続Viewの登録 (再起動してもボタンが動くようにする)
+        # 永続Viewの登録
         self.add_view(AdminPanelView())
         self.add_view(AttendanceView())
         
-        # RoomStatusViewは動的要素（Selectの選択肢）が含まれるため、
-        # DBから現在の部屋情報を読み込んで初期化してから登録する
         async with Database.connect() as db:
             async with await db.execute('SELECT name, is_open FROM rooms ORDER BY name') as cursor:
                 rooms = await cursor.fetchall()
@@ -528,14 +536,12 @@ class CircleManagerBot(commands.Bot):
             logger.info(f'   - サーバー名: {guild.name} (ID: {guild.id})')
         logger.info('========================================')
         
-        # パネルの自己修復機能：管理チャンネルにパネルがなければ送信する
         try:
             admin_channel = self.get_channel(ADMIN_CHANNEL_ID)
             if not admin_channel:
                 admin_channel = await self.fetch_channel(ADMIN_CHANNEL_ID)
         except Exception as e:
             logger.error(f'管理チャンネル (ID: {ADMIN_CHANNEL_ID}) の取得に失敗: {e}')
-            logger.error('   -> .env の ADMIN_CHANNEL_ID が正しいか確認してください。')
             admin_channel = None
 
         if admin_channel:
@@ -564,62 +570,64 @@ class CircleManagerBot(commands.Bot):
     # 定期タスク：出欠パネルのバッチ更新 (5秒に1回)
     @tasks.loop(seconds=5.0)
     async def update_attendance_panels(self):
-        attendance_channel = self.get_channel(ATTENDANCE_CHANNEL_ID)
-        if not attendance_channel:
-            return
+        try:
+            attendance_channel = self.get_channel(ATTENDANCE_CHANNEL_ID)
+            if not attendance_channel:
+                return
 
-        today_str = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+            today_str = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
 
-        async with Database.connect() as db:
-            async with await db.execute('SELECT message_id, name, date, event_date FROM events') as event_cursor:
-                events = await event_cursor.fetchall()
-                
-                for event in events:
-                    msg_id, name, date, event_date = event
+            async with Database.connect() as db:
+                async with await db.execute('SELECT message_id, name, date, event_date FROM events') as event_cursor:
+                    events = await event_cursor.fetchall()
                     
-                    # Discordイベント連携で作られたパネルのうち、今日以外のものは自動削除
-                    if event_date is not None and event_date != today_str:
+                    for event in events:
+                        msg_id, name, date, event_date = event
+                        
+                        if event_date is not None and event_date != today_str:
+                            try:
+                                msg = await attendance_channel.fetch_message(msg_id)
+                                await msg.delete()
+                            except Exception:
+                                pass
+                            await db.execute('DELETE FROM events WHERE message_id = ?', (msg_id,))
+                            await db.execute('DELETE FROM attendances WHERE message_id = ?', (msg_id,))
+                            await db.commit()
+                            continue
+                            
                         try:
                             msg = await attendance_channel.fetch_message(msg_id)
-                            await msg.delete()
-                        except Exception:
-                            pass
-                        await db.execute('DELETE FROM events WHERE message_id = ?', (msg_id,))
-                        await db.execute('DELETE FROM attendances WHERE message_id = ?', (msg_id,))
-                        await db.commit()
-                        continue
+                        except discord.NotFound:
+                            await db.execute('DELETE FROM events WHERE message_id = ?', (msg_id,))
+                            await db.execute('DELETE FROM attendances WHERE message_id = ?', (msg_id,))
+                            await db.commit()
+                            continue
+                        except discord.HTTPException:
+                            continue
+                            
+                        async with await db.execute('SELECT user_name, status FROM attendances WHERE message_id = ?', (msg_id,)) as att_cursor:
+                            attendances = await att_cursor.fetchall()
+                            
+                        att_yes = [a[0] for a in attendances if a[1] == "出席"]
+                        att_no = [a[0] for a in attendances if a[1] == "欠席"]
+                        att_maybe = [a[0] for a in attendances if a[1] == "遅刻/未定"]
                         
-                    try:
-                        msg = await attendance_channel.fetch_message(msg_id)
-                    except discord.NotFound:
-                        await db.execute('DELETE FROM events WHERE message_id = ?', (msg_id,))
-                        await db.execute('DELETE FROM attendances WHERE message_id = ?', (msg_id,))
-                        await db.commit()
-                        continue
-                    except discord.HTTPException:
-                        continue
-                        
-                    # そのイベントの出欠状況を取得
-                    async with await db.execute('SELECT user_name, status FROM attendances WHERE message_id = ?', (msg_id,)) as att_cursor:
-                        attendances = await att_cursor.fetchall()
-                        
-                    att_yes = [a[0] for a in attendances if a[1] == "出席"]
-                    att_no = [a[0] for a in attendances if a[1] == "欠席"]
-                    att_maybe = [a[0] for a in attendances if a[1] == "遅刻/未定"]
-                    
-                    if event_date is None:
-                        desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n\n"
-                    else:
-                        desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n※開催日({event_date})になるまで登録できません。\n\n"
+                        if event_date is None:
+                            desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n\n"
+                        else:
+                            desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n※開催日({event_date})になるまで登録できません。\n\n"
 
-                    desc += f"**【出席】 ({len(att_yes)}名)**\n" + (", ".join(att_yes) if att_yes else "なし") + "\n\n"
-                    desc += f"**【欠席】 ({len(att_no)}名)**\n" + (", ".join(att_no) if att_no else "なし") + "\n\n"
-                    desc += f"**【遅刻/未定】 ({len(att_maybe)}名)**\n" + (", ".join(att_maybe) if att_maybe else "なし")
-                    
-                    current_desc = msg.embeds[0].description if msg.embeds else ""
-                    if current_desc != desc:
-                        embed = discord.Embed(title=f"📅 {name}", description=desc, color=discord.Color.blue())
-                        await msg.edit(embed=embed)
+                        desc += f"**【出席】 ({len(att_yes)}名)**\n" + (", ".join(att_yes) if att_yes else "なし") + "\n\n"
+                        desc += f"**【欠席】 ({len(att_no)}名)**\n" + (", ".join(att_no) if att_no else "なし") + "\n\n"
+                        desc += f"**【遅刻/未定】 ({len(att_maybe)}名)**\n" + (", ".join(att_maybe) if att_maybe else "なし")
+                        
+                        current_desc = msg.embeds[0].description if msg.embeds else ""
+                        if current_desc != desc:
+                            embed = discord.Embed(title=f"📅 {name}", description=desc, color=discord.Color.blue())
+                            await msg.edit(embed=embed)
+        except Exception as e:
+            # 万が一のエラー時もループをクラッシュさせずに継続
+            pass
 
     @update_attendance_panels.before_loop
     async def before_update_attendance(self):
@@ -628,40 +636,43 @@ class CircleManagerBot(commands.Bot):
     # 定期タスク：部屋状況パネルのバッチ更新 (5秒に1回)
     @tasks.loop(seconds=5.0)
     async def update_room_panels(self):
-        room_channel = self.get_channel(ROOM_STATUS_CHANNEL_ID)
-        if not room_channel:
-            return
-
-        async with Database.connect() as db:
-            async with await db.execute('SELECT message_id FROM room_panel WHERE id = 1') as cursor:
-                row = await cursor.fetchone()
-                if not row:
-                    return
-                msg_id = row[0]
-                
-            try:
-                msg = await room_channel.fetch_message(msg_id)
-            except (discord.NotFound, discord.HTTPException):
+        try:
+            room_channel = self.get_channel(ROOM_STATUS_CHANNEL_ID)
+            if not room_channel:
                 return
-                
-            async with await db.execute('SELECT name, is_open, last_updated FROM rooms ORDER BY name') as cursor:
-                rooms = await cursor.fetchall()
-                
-            desc = ""
-            if not rooms:
-                desc = "登録されている部屋がありません。"
-            else:
-                for room in rooms:
-                    name, is_open, last_updated = room
-                    status_emoji = "🟢" if is_open else "🔴"
-                    status_text = "開放中" if is_open else "施錠中"
-                    desc += f"{status_emoji} **{name}** : {status_text} (更新: {last_updated})\n"
+
+            async with Database.connect() as db:
+                async with await db.execute('SELECT message_id FROM room_panel WHERE id = 1') as cursor:
+                    row = await cursor.fetchone()
+                    if not row:
+                        return
+                    msg_id = row[0]
                     
-            current_desc = msg.embeds[0].description if msg.embeds else ""
-            if current_desc != desc:
-                embed = discord.Embed(title="🏢 部室・施設の利用状況", description=desc, color=discord.Color.green())
-                view = RoomStatusView(rooms)
-                await msg.edit(embed=embed, view=view)
+                try:
+                    msg = await room_channel.fetch_message(msg_id)
+                except (discord.NotFound, discord.HTTPException):
+                    return
+                    
+                async with await db.execute('SELECT name, is_open, last_updated FROM rooms ORDER BY name') as cursor:
+                    rooms = await cursor.fetchall()
+                    
+                desc = ""
+                if not rooms:
+                    desc = "登録されている部屋がありません。"
+                else:
+                    for room in rooms:
+                        name, is_open, last_updated = room
+                        status_emoji = "🟢" if is_open else "🔴"
+                        status_text = "開放中" if is_open else "施錠中"
+                        desc += f"{status_emoji} **{name}** : {status_text} (更新: {last_updated})\n"
+                        
+                current_desc = msg.embeds[0].description if msg.embeds else ""
+                if current_desc != desc:
+                    embed = discord.Embed(title="🏢 部室・施設の利用状況", description=desc, color=discord.Color.green())
+                    view = RoomStatusView(rooms)
+                    await msg.edit(embed=embed, view=view)
+        except Exception as e:
+            pass
 
     @update_room_panels.before_loop
     async def before_update_rooms(self):
