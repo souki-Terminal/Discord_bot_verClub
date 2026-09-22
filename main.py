@@ -65,13 +65,13 @@ class Database:
         if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
             try:
                 import libsql_client
-                self._client = libsql_client.create_client_async(
+                self._client = libsql_client.create_client(
                     url=TURSO_DATABASE_URL,
                     auth_token=TURSO_AUTH_TOKEN
                 )
                 self._is_turso = True
-            except ImportError:
-                print("⚠️ libsql-client が見つからないためローカルSQLiteにフォールバックします")
+            except Exception as e:
+                print(f"⚠️ Turso接続初期化エラー ({e})。ローカルSQLiteにフォールバックします", flush=True)
                 self._conn = await aiosqlite.connect(DB_FILE)
                 self._is_turso = False
         else:
