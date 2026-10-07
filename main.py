@@ -199,10 +199,14 @@ class AttendanceView(discord.ui.View):
                     row = await cursor.fetchone()
                     if row and row[0]:
                         event_date = row[0]
-                        # 開催日前なら登録ブロックしてパネルを削除
+                        # 開催日前なら登録ブロック
                         if today_str < event_date:
+                            await interaction.followup.send(f"このイベント（{event_date}）はまだ開催日ではありません。当日になってから登録してください。", ephemeral=True)
+                            return
+                        # 過去のイベントならパネルを削除
+                        elif today_str > event_date:
                             await interaction.message.delete()
-                            await interaction.followup.send(f"このイベント（{event_date}）は本日ではないため、古いパネルを削除しました。", ephemeral=True)
+                            await interaction.followup.send(f"このイベント（{event_date}）は過去のイベントのため、古いパネルを削除しました。", ephemeral=True)
                             return
 
                 # データベースの出欠情報を更新 (なければ挿入)
@@ -394,7 +398,8 @@ class AddRoomModal(discord.ui.Modal, title='部屋の追加'):
                 await db.execute('INSERT INTO rooms (name, is_open, last_updated) VALUES (?, 0, ?)', (name, now))
                 await db.commit()
                 await interaction.response.send_message(f"部屋「{name}」を追加しました！", ephemeral=True)
-            except Exception:
+            except Exception as e:
+                logging.getLogger('discord').error(f"Failed to add room '{name}': {e}")
                 await interaction.response.send_message(f"部屋「{name}」は既に存在するか、追加に失敗しました。", ephemeral=True)
 
 # 部屋削除用のModal
@@ -482,8 +487,8 @@ class AdminPanelView(discord.ui.View):
             
         try:
             await channel.purge(check=lambda m: m.author == interaction.client.user, limit=50)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.getLogger('discord').error(f"Failed to purge room channel: {e}")
             
         async with Database.connect() as db:
             async with await db.execute('SELECT name, is_open FROM rooms ORDER BY name') as cursor:
@@ -584,7 +589,8 @@ class CircleManagerBot(commands.Bot):
                     for event in events:
                         msg_id, name, date, event_date = event
                         
-                        if event_date is not None and event_date != today_str:
+                        # 過去のイベントは削除する (未来のイベントは残す)
+                        if event_date is not None and event_date < today_str:
                             try:
                                 msg = await attendance_channel.fetch_message(msg_id)
                                 await msg.delete()
@@ -627,7 +633,7 @@ class CircleManagerBot(commands.Bot):
                             await msg.edit(embed=embed)
         except Exception as e:
             # 万が一のエラー時もループをクラッシュさせずに継続
-            pass
+            logging.getLogger('discord').error(f"Error in update_attendance_panels: {e}")
 
     @update_attendance_panels.before_loop
     async def before_update_attendance(self):
@@ -672,7 +678,7 @@ class CircleManagerBot(commands.Bot):
                     view = RoomStatusView(rooms)
                     await msg.edit(embed=embed, view=view)
         except Exception as e:
-            pass
+            logging.getLogger('discord').error(f"Error in update_room_panels: {e}")
 
     @update_room_panels.before_loop
     async def before_update_rooms(self):
